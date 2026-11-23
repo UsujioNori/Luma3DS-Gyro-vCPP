@@ -55,6 +55,16 @@ static u32 irData[] = { 0x80800081 }; // Default: C-Stick at the center, no butt
 
 int inputRedirectionStartResult;
 
+static void InputRedirection_TryOpenRehidHandle(Handle *handle)
+{
+    if (*handle != 0 || !isServiceUsable("hid:USER"))
+        return;
+
+    Handle newHandle = 0;
+    if (R_SUCCEEDED(srvGetServiceHandle(&newHandle, "hid:USER")))
+        *handle = newHandle;
+}
+
 void inputRedirectionThreadMain(void)
 {
     Result res = 0;
@@ -114,10 +124,20 @@ void inputRedirectionThreadMain(void)
 
     u32 *irDataPhys = PA_FROM_VA_PTR(irData);
 
-    char buf[20];
+    Handle hidUserHandle = 0;
+    u32 rehidServiceRetry = 0;
+    InputRedirection_TryOpenRehidHandle(&hidUserHandle);
+
+    char buf[40];
     u32 oldSpecialButtons = 0, specialButtons = 0;
     while(inputRedirectionEnabled && !preTerminationRequested)
     {
+        if (hidUserHandle == 0 && ++rehidServiceRetry >= 100)
+        {
+            rehidServiceRetry = 0;
+            InputRedirection_TryOpenRehidHandle(&hidUserHandle);
+        }
+
         struct pollfd pfd;
         pfd.fd = sock;
         pfd.events = POLLIN;
@@ -133,7 +153,7 @@ void inputRedirectionThreadMain(void)
         int pollres = socPoll(&pfd, 1, 10);
         if(pollres > 0 && (pfd.revents & POLLIN))
         {
-            int n = socRecvfrom(sock, buf, 20, 0, NULL, 0);
+            int n = socRecvfrom(sock, buf, sizeof(buf), 0, NULL, 0);
             if(n < 0)
                 break;
             else if(n < 12)
@@ -143,6 +163,43 @@ void inputRedirectionThreadMain(void)
             if(n >= 20)
             {
                 memcpy(irDataPhys, buf + 12, 4);
+
+                // Forward Circle Pad Pro input to Rehid.
+                if (hidUserHandle != 0)
+                {
+                    u32 cppState;
+                    memcpy(&cppState, buf + 12, sizeof(cppState));
+
+                    u32 *cmdbuf = getThreadCommandBuffer();
+                    u32 gyroTag = 0;
+                    if (n == 32 || n == 40)
+                        memcpy(&gyroTag, buf + 20, sizeof(gyroTag));
+
+                    const bool hasGyro = gyroTag == 0x31525947;
+                    const bool hasAccel = hasGyro && n == 40;
+                    cmdbuf[0] = IPC_MakeHeader(0x19, hasAccel ? 5 : hasGyro ? 3 : 1, 0);
+                    cmdbuf[1] = cppState;
+                    if (hasGyro)
+                    {
+                        memcpy(&cmdbuf[2], buf + 24, sizeof(u32));
+                        memcpy(&cmdbuf[3], buf + 28, sizeof(u32));
+                    }
+
+                    if (hasAccel)
+                    {
+                        memcpy(&cmdbuf[4], buf + 32, sizeof(u32));
+                        memcpy(&cmdbuf[5], buf + 36, sizeof(u32));
+                    }
+
+                    Result ipcRes = svcSendSyncRequest(hidUserHandle);
+
+                    if (R_FAILED(ipcRes) || R_FAILED((Result)cmdbuf[1]))
+                    {
+                        svcCloseHandle(hidUserHandle);
+                        hidUserHandle = 0;
+                        rehidServiceRetry = 0;
+                    }
+                }
 
                 oldSpecialButtons = specialButtons;
                 memcpy(&specialButtons, buf + 16, 4);
@@ -170,6 +227,9 @@ void inputRedirectionThreadMain(void)
 
     socSetsockopt(sock, SOL_SOCKET, SO_LINGER, &linger, sizeof(struct linger));
     socClose(sock);
+
+    if (hidUserHandle != 0)
+        svcCloseHandle(hidUserHandle);
 
     miniSocExit();
 }
